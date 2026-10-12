@@ -61,6 +61,62 @@ CREATE TABLE IF NOT EXISTS actions (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    full_name TEXT,
+    role TEXT NOT NULL CHECK (role IN ('admin','lead','msl','viewer')),
+    password_hash TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pv_referrals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    interaction_id INTEGER REFERENCES interactions(id) ON DELETE SET NULL,
+    kol_id INTEGER REFERENCES kols(id) ON DELETE SET NULL,
+    excerpt TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','reported','not_an_ae')),
+    due_at TEXT NOT NULL,
+    pv_case_ref TEXT,
+    notes TEXT,
+    created_by INTEGER REFERENCES users(id),
+    resolved_by INTEGER REFERENCES users(id),
+    resolved_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Append-only, hash-chained audit trail. UPDATE/DELETE are blocked at the DB level.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    user_id INTEGER,
+    username TEXT,
+    action TEXT NOT NULL,
+    entity TEXT NOT NULL,
+    entity_id INTEGER,
+    before_json TEXT,
+    after_json TEXT,
+    reason TEXT,
+    prev_hash TEXT NOT NULL,
+    hash TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+
 CREATE INDEX IF NOT EXISTS idx_interactions_kol ON interactions(kol_id);
 CREATE INDEX IF NOT EXISTS idx_interactions_date ON interactions(date);
 CREATE INDEX IF NOT EXISTS idx_insights_kol ON insights(kol_id);
@@ -81,8 +137,22 @@ def connect(path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
+# Columns added after the first release; applied to existing databases on startup.
+MIGRATIONS = {
+    "kols": {
+        "consent_status": "TEXT NOT NULL DEFAULT 'unknown'",
+        "consent_date": "TEXT",
+    },
+}
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    for table, cols in MIGRATIONS.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col, ddl in cols.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     conn.commit()
 
 

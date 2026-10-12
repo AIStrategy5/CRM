@@ -77,16 +77,19 @@ def test_claude_path_filters_invalid_ids_and_unions_compliance(monkeypatch):
     class FakeClient:
         def __init__(self, *a, **k):
             self.messages = types.SimpleNamespace(parse=self.parse)
+            self.beta = types.SimpleNamespace(messages=types.SimpleNamespace(parse=self.parse))
 
         def parse(self, **kwargs):
             calls.update(kwargs)
-            return types.SimpleNamespace(stop_reason="end_turn", parsed_output=fake)
+            return types.SimpleNamespace(stop_reason="end_turn", parsed_output=fake, model="claude-opus-4-8")
 
     monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
     its = [{"id": 1, "kol_id": 1, "date": "2026-01-01", "type": "one_to_one", "topics": "",
             "notes": "Patient hospitalized after dose.", "sentiment": 0}]
-    res = ai.synthesize_claude(its, {1: {"id": 1, "name": "Dr. X", "tier": 1}})
+    res, served = ai.synthesize_claude(its, {1: {"id": 1, "name": "Dr. X", "tier": 1}})
+    assert served == "claude-opus-4-8"
     assert calls["model"] == ai.MODEL and calls["output_format"] is SynthesisResult
+    assert calls["fallbacks"] == "default" and calls["betas"] == [ai.FALLBACK_BETA]
     assert "Dr. X" not in calls["messages"][0]["content"]
     assert res.themes[0].supporting_interaction_ids == [1]
     assert res.actionable_outcomes[0].supporting_interaction_ids == []
@@ -101,9 +104,34 @@ def test_claude_refusal_raises(monkeypatch):
 
     class FakeClient:
         def __init__(self, *a, **k):
-            self.messages = types.SimpleNamespace(
+            p = types.SimpleNamespace(
                 parse=lambda **kw: types.SimpleNamespace(stop_reason="refusal", parsed_output=None))
+            self.messages = p
+            self.beta = types.SimpleNamespace(messages=p)
 
     monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
     with pytest.raises(RuntimeError, match="refusal"):
         ai.synthesize_claude([{"id": 1, "kol_id": 1, "date": "2026-01-01", "type": "congress"}], {1: {}})
+
+
+def test_fallbacks_can_be_disabled(monkeypatch):
+    import types
+
+    import anthropic
+
+    from app.models import SynthesisResult
+    used = {}
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            ok = SynthesisResult(executive_summary="s", themes=[], actionable_outcomes=[],
+                                 compliance_flags=[], knowledge_gaps=[])
+            self.messages = types.SimpleNamespace(
+                parse=lambda **kw: used.update(kw, path="ga") or types.SimpleNamespace(
+                    stop_reason="end_turn", parsed_output=ok, model=ai.MODEL))
+            self.beta = types.SimpleNamespace(messages=types.SimpleNamespace(parse=None))
+
+    monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
+    monkeypatch.setattr(ai, "FALLBACKS_ENABLED", False)
+    _, served = ai.synthesize_claude([{"id": 1, "kol_id": 1, "date": "d", "type": "t"}], {1: {}})
+    assert used["path"] == "ga" and "fallbacks" not in used and served == ai.MODEL

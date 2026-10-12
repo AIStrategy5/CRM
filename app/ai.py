@@ -20,6 +20,10 @@ from .models import (ActionableOutcome, ComplianceFlag, SynthesisResult, Theme)
 log = logging.getLogger(__name__)
 
 MODEL = os.environ.get("CRM_CLAUDE_MODEL", "claude-opus-5-5")
+# Server-side refusal fallback ("default" routing). Supported on the Claude API and Claude Platform
+# on AWS; set CRM_CLAUDE_FALLBACKS=0 when pointing the SDK at Bedrock / Vertex / Foundry.
+FALLBACKS_ENABLED = os.environ.get("CRM_CLAUDE_FALLBACKS", "1") != "0"
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 # --------------------------------------------------------------------------------------
 # Rule-based engine
@@ -189,12 +193,13 @@ def claude_available() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
 
 
-def synthesize_claude(interactions: list[dict], kols: dict[int, dict]) -> SynthesisResult:
+def synthesize_claude(interactions: list[dict], kols: dict[int, dict]) -> tuple[SynthesisResult, str]:
+    """Returns (result, model that served the response)."""
     import anthropic
     from .models import INSIGHT_CATEGORIES, OWNER_FUNCTIONS
 
     client = anthropic.Anthropic()
-    response = client.messages.parse(
+    kwargs = dict(
         model=MODEL,
         max_tokens=16000,
         system=SYSTEM_PROMPT.format(owners=", ".join(OWNER_FUNCTIONS),
@@ -202,6 +207,11 @@ def synthesize_claude(interactions: list[dict], kols: dict[int, dict]) -> Synthe
         messages=[{"role": "user", "content": _claude_payload(interactions, kols)}],
         output_format=SynthesisResult,
     )
+    if FALLBACKS_ENABLED:
+        # On a safety-classifier refusal the API re-runs the request on a fallback model server-side.
+        response = client.beta.messages.parse(**kwargs, betas=[FALLBACK_BETA], fallbacks="default")
+    else:
+        response = client.messages.parse(**kwargs)
     if response.stop_reason == "refusal":
         raise RuntimeError("Claude declined the request (stop_reason=refusal)")
     if response.parsed_output is None:
@@ -216,7 +226,7 @@ def synthesize_claude(interactions: list[dict], kols: dict[int, dict]) -> Synthe
     seen = {(f.interaction_id, f.flag_type) for f in result.compliance_flags}
     result.compliance_flags += [f for f in compliance_scan(interactions)
                                 if (f.interaction_id, f.flag_type) not in seen]
-    return result
+    return result, getattr(response, "model", None) or MODEL
 
 
 def synthesize(interactions: list[dict], kols: dict[int, dict], use_ai: bool = True) -> dict:
@@ -229,8 +239,9 @@ def synthesize(interactions: list[dict], kols: dict[int, dict], use_ai: bool = T
     warning = None
     if use_ai and claude_available():
         try:
-            return {"engine": "claude", "model": MODEL, "warning": None,
-                    "result": synthesize_claude(interactions, kols).model_dump()}
+            result, served = synthesize_claude(interactions, kols)
+            note = (f"Requested {MODEL}; served by fallback model {served}." if served != MODEL else None)
+            return {"engine": "claude", "model": served, "warning": note, "result": result.model_dump()}
         except Exception as exc:  # network, auth, refusal, validation - degrade gracefully
             log.warning("Claude synthesis failed, using rule engine: %s", exc)
             warning = f"AI engine unavailable ({type(exc).__name__}); showing rule-based synthesis."

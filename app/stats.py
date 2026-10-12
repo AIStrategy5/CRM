@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import numpy as np
 from scipy import stats as sps
@@ -62,7 +62,7 @@ def mean_ci(values: list[float], confidence: float = 0.95) -> dict:
     return {"n": n, "mean": _round(m), "ci_low": _round(lo), "ci_high": _round(hi)}
 
 
-def influence_score(kol: dict) -> float:
+def influence_score(kol: dict, cfg: dict | None = None) -> float:
     """0-100 proxy for scientific influence from publications, trials and tier.
 
     Log-scaled so a handful of prolific authors don't dominate. This is a
@@ -71,13 +71,17 @@ def influence_score(kol: dict) -> float:
     pubs = math.log1p(kol.get("publications") or 0) / math.log1p(300)
     trials = math.log1p(kol.get("trials_involved") or 0) / math.log1p(40)
     tier = {1: 1.0, 2: 0.6, 3: 0.3}.get(kol.get("tier") or 2, 0.6)
-    return round(100 * min(1.0, 0.45 * pubs + 0.30 * trials + 0.25 * tier), 1)
+    w = (cfg or {}).get("influence_weights") or {"publications": 0.45, "trials": 0.30, "tier": 0.25}
+    return round(100 * min(1.0, w["publications"] * pubs + w["trials"] * trials + w["tier"] * tier), 1)
 
 
 def kol_engagement(kols: list[dict], interactions: list[dict], insights: list[dict],
-                   today: date | None = None) -> list[dict]:
+                   today: date | None = None, cfg: dict | None = None) -> list[dict]:
     """Per-KOL engagement metrics with a recency-decayed, type-weighted score."""
     today = today or date.today()
+    cfg = cfg or {}
+    weights = cfg.get("type_weights") or TYPE_WEIGHTS
+    half_life = cfg.get("recency_half_life_days") or RECENCY_HALF_LIFE_DAYS
     by_kol: dict[int, list[dict]] = defaultdict(list)
     for it in interactions:
         by_kol[it["kol_id"]].append(it)
@@ -90,8 +94,8 @@ def kol_engagement(kols: list[dict], interactions: list[dict], insights: list[di
         score = 0.0
         for it in its:
             age = max(0, (today - _d(it["date"])).days)
-            decay = 0.5 ** (age / RECENCY_HALF_LIFE_DAYS)
-            score += TYPE_WEIGHTS.get(it["type"], 1.0) * decay
+            decay = 0.5 ** (age / half_life)
+            score += weights.get(it["type"], 1.0) * decay
         raw[k["id"]] = score
         last = max((_d(it["date"]) for it in its), default=None)
         sents = [it["sentiment"] for it in its if it.get("sentiment") is not None]
@@ -105,7 +109,7 @@ def kol_engagement(kols: list[dict], interactions: list[dict], insights: list[di
             "days_since_last": (today - last).days if last else None,
             "avg_sentiment": _round(np.mean(sents)) if sents else None,
             "insights": insight_counts.get(k["id"], 0),
-            "influence": influence_score(k),
+            "influence": influence_score(k, cfg),
             "_raw": score,
         })
     top = max(raw.values(), default=0) or 1.0
@@ -269,8 +273,12 @@ def insight_category_association(insights: list[dict]) -> dict | None:
 
 
 def overview(kols: list[dict], interactions: list[dict], insights: list[dict],
-             actions: list[dict], today: date | None = None, window_days: int = 90) -> dict:
+             actions: list[dict], today: date | None = None, window_days: int = 90,
+             pv: list[dict] | None = None, now_iso: str | None = None) -> dict:
     today = today or date.today()
+    pv = pv or []
+    open_pv = [r for r in pv if r["status"] == "open"]
+    now_iso = now_iso or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     recent = [i for i in interactions if 0 <= (today - _d(i["date"])).days <= window_days]
     engaged = {i["kol_id"] for i in recent}
     tier1 = [k for k in kols if k["tier"] == 1]
@@ -289,15 +297,18 @@ def overview(kols: list[dict], interactions: list[dict], insights: list[dict],
         "sentiment": mean_ci(sents),
         "open_actions": len(open_actions),
         "overdue_actions": len(overdue),
+        "open_pv_referrals": len(open_pv),
+        "overdue_pv_referrals": sum(1 for r in open_pv if r["due_at"] < now_iso),
         "by_type": dict(Counter(i["type"] for i in interactions).most_common()),
         "by_category": dict(Counter(i["category"] for i in insights).most_common()),
     }
 
 
-def full_report(kols, interactions, insights, actions, today: date | None = None) -> dict:
-    eng = kol_engagement(kols, interactions, insights, today)
+def full_report(kols, interactions, insights, actions, today: date | None = None,
+                cfg: dict | None = None, pv: list[dict] | None = None) -> dict:
+    eng = kol_engagement(kols, interactions, insights, today, cfg)
     return {
-        "overview": overview(kols, interactions, insights, actions, today),
+        "overview": overview(kols, interactions, insights, actions, today, pv=pv),
         "engagement": eng,
         "segments": dict(Counter(r["segment"] for r in eng)),
         "monthly": monthly_trend(interactions),

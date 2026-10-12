@@ -48,6 +48,8 @@ class KOLIn(BaseModel):
     trials_involved: int = Field(0, ge=0)
     email: Optional[str] = None
     notes: Optional[str] = None
+    consent_status: Literal["unknown", "granted", "withdrawn"] = "unknown"
+    consent_date: Optional[date] = None
 
 
 class InteractionIn(BaseModel):
@@ -84,6 +86,41 @@ class ActionPatch(BaseModel):
     status: Optional[Literal["open", "in_progress", "done"]] = None
     priority: Optional[Literal["low", "medium", "high"]] = None
     due_date: Optional[date] = None
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class UserIn(BaseModel):
+    username: str = Field(min_length=2, max_length=64, pattern=r"^[A-Za-z0-9_.@-]+$")
+    full_name: Optional[str] = None
+    role: Literal["admin", "lead", "msl", "viewer"]
+    password: str = Field(min_length=10)
+
+
+class UserPatch(BaseModel):
+    full_name: Optional[str] = None
+    role: Optional[Literal["admin", "lead", "msl", "viewer"]] = None
+    active: Optional[bool] = None
+    password: Optional[str] = Field(None, min_length=10)
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=10)
+
+
+class PVPatch(BaseModel):
+    status: Literal["open", "reported", "not_an_ae"]
+    pv_case_ref: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class RetentionRequest(BaseModel):
+    older_than_days: Optional[int] = Field(None, ge=30)
+    dry_run: bool = True
 
 
 class SynthesisRequest(BaseModel):

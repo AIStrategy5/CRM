@@ -6,15 +6,41 @@ const label = (s) => String(s ?? "").replace(/_/g, " ");
 const fmt = (v, d = 2) => (v === null || v === undefined ? "–" : Number(v).toFixed(d));
 const fmtP = (p) => (p === null || p === undefined ? "=–" : p < 0.001 ? "<0.001" : "=" + Number(p).toFixed(3));
 
+// ------------------------------------------------------------------ session
+let TOKEN = null, ME = null;
+try { TOKEN = sessionStorage.getItem("crm_token"); } catch { /* storage unavailable: keep in memory */ }
+function setToken(t) {
+  TOKEN = t;
+  try { t ? sessionStorage.setItem("crm_token", t) : sessionStorage.removeItem("crm_token"); } catch { /* ignore */ }
+}
+const can = (perm) => !!ME && ME.permissions.includes(perm);
+
 async function api(path, opts = {}) {
-  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts,
+  const headers = { "Content-Type": "application/json" };
+  if (TOKEN) headers.Authorization = "Bearer " + TOKEN;
+  if (opts.reason) headers["X-Change-Reason"] = opts.reason;
+  const res = await fetch(path, { ...opts, headers,
     body: opts.body && typeof opts.body !== "string" ? JSON.stringify(opts.body) : opts.body });
+  if (res.status === 401 && !path.startsWith("/api/auth/login")) { showLogin(); throw new Error("Please sign in"); }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail || res.statusText));
   }
   return res.status === 204 ? null : res.json();
 }
+// Ask for a reason for change (GxP-style) when the admin setting requires one. Returns null if cancelled.
+function askReason(what) {
+  if (!META.require_change_reason) return "n/a";
+  const r = prompt(`Reason for ${what}:`);
+  return r && r.trim() ? r.trim() : null;
+}
+async function download(table) {
+  const res = await fetch(`/api/export/${table}.csv`, { headers: { Authorization: "Bearer " + TOKEN } });
+  if (!res.ok) return alert("Export failed: " + res.status);
+  const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(await res.blob()), download: `${table}.csv` });
+  a.click(); URL.revokeObjectURL(a.href);
+}
+document.addEventListener("click", (e) => { const b = e.target.closest("[data-export]"); if (b) download(b.dataset.export); });
 const formData = (form) => Object.fromEntries([...new FormData(form)].filter(([, v]) => v !== ""));
 
 let META = {}, KOLS = [];
@@ -35,11 +61,31 @@ function show(view) {
   $$("#nav button").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + view));
   ({ dashboard: loadDashboard, kols: loadKols, interactions: loadInteractions, ai: loadInsights,
-     actions: loadActions, analytics: loadAnalytics })[view]?.();
+     actions: loadActions, analytics: loadAnalytics, pv: loadPV, admin: loadAdmin })[view]?.();
 }
 
 // ------------------------------------------------------------------ bootstrap
+function showLogin() { $("#loginScreen").hidden = false; $("#loginForm [name=username]").focus(); }
+$("#loginForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    const r = await api("/api/auth/login", { method: "POST", body: formData(e.target) });
+    setToken(r.token); e.target.reset(); $("#loginError").textContent = "";
+    $("#loginScreen").hidden = true; init();
+  } catch (err) { $("#loginError").textContent = err.message; }
+});
+$("#btnLogout").onclick = async () => { try { await api("/api/auth/logout", { method: "POST" }); } catch { /* ignore */ } setToken(null); ME = null; showLogin(); };
+
+function applyPermissions() {
+  $$("[data-perm]").forEach((el) => el.classList.toggle("no-perm", !can(el.dataset.perm)));
+  // Admin tab: visible to anyone who can read the audit trail.
+  $("#whoami").textContent = `${ME.full_name || ME.username} · ${ME.role}`;
+}
+
 async function init() {
+  if (!TOKEN) return showLogin();
+  try { ME = await api("/api/auth/me"); } catch { return; }
+  applyPermissions();
   META = await api("/api/meta");
   $("#engine").textContent = META.ai_engine === "claude" ? `AI: Claude (${META.model})` : "AI: rule-based (no API key)";
   const opt = (arr) => arr.map((x) => `<option value="${esc(x)}">${esc(label(x))}</option>`).join("");
@@ -49,7 +95,13 @@ async function init() {
   $("#actionForm [name=owner_function]").innerHTML = opt(META.owner_functions);
   $("#interactionForm [name=date]").valueAsDate = new Date();
   await refreshKolOptions();
-  loadDashboard();
+  show("dashboard");
+  refreshPVBadge();
+}
+async function refreshPVBadge() {
+  if (!can("pv.read")) return;
+  const open = (await api("/api/pv?status=open")).length;
+  $("#pvBadge").hidden = !open; $("#pvBadge").textContent = open;
 }
 async function refreshKolOptions() {
   KOLS = await api("/api/kols");
@@ -77,6 +129,7 @@ async function loadDashboard() {
     kpi(fmt(o.sentiment.mean), `Mean sentiment (95% CI ${fmt(o.sentiment.ci_low)}–${fmt(o.sentiment.ci_high)})`),
     kpi(o.insights, "Insights captured"),
     kpi(`${o.open_actions}<span class="muted" style="font-size:14px"> / ${o.overdue_actions} overdue</span>`, "Open actions"),
+    kpi(`${o.open_pv_referrals}<span class="muted" style="font-size:14px"> / ${o.overdue_pv_referrals} overdue</span>`, "Open PV referrals"),
   ].join("");
 
   const m = r.monthly.months;
@@ -123,16 +176,28 @@ $("#kolTA").onchange = loadKols; $("#kolTier").onchange = loadKols;
 async function showKol(id) {
   const k = await api("/api/kols/" + id);
   $("#kolDetail").innerHTML = `<div class="card"><h3>${esc(k.name)} <span class="muted">${esc(k.specialty)} · ${esc(k.institution)} · ${esc(k.region)} · Tier ${k.tier}</span></h3>
-    <p>Influence ${k.influence} · ${k.publications} publications · ${k.trials_involved} trials · ${esc(k.email)}</p>
-    <div class="row" style="flex:0"><button class="small" id="editKol">Edit</button><button class="small" id="synthKol">AI synthesis for this KOL</button>
-      <button class="small" id="delKol">Delete</button></div>
+    <p>Influence ${k.influence} · ${k.publications} publications · ${k.trials_involved} trials · ${esc(k.email)} ·
+      consent <span class="tag ${k.consent_status === "granted" ? "good" : k.consent_status === "withdrawn" ? "bad" : "warn"}">${esc(k.consent_status)}</span></p>
+    <div class="row" style="flex:0">${can("kol.write") ? '<button class="small" id="editKol">Edit</button>' : ""}
+      ${can("ai.run") && k.consent_status !== "withdrawn" ? '<button class="small" id="synthKol">AI synthesis for this KOL</button>' : ""}
+      ${can("data.export") ? '<button class="small" id="exportKol">Export all data (JSON)</button>' : ""}
+      ${can("kol.delete") ? '<button class="small danger" id="delKol">Delete</button>' : ""}</div>
     <h3>Interactions (${k.interactions.length})</h3>
     <div class="list">${k.interactions.map(renderInteraction).join("") || '<p class="hint">None yet.</p>'}</div>
     <h3>Insights (${k.insights.length})</h3>
     <div class="list">${k.insights.map((s) => `<div><span class="tag">${esc(label(s.category))}</span> ${esc(s.text)}</div>`).join("") || '<p class="hint">None yet.</p>'}</div></div>`;
-  $("#editKol").onclick = () => openKolDialog(k);
-  $("#synthKol").onclick = () => { show("ai"); $("#aiKol").value = k.id; runSynthesis(); };
-  $("#delKol").onclick = async () => { if (confirm(`Delete ${k.name} and all their interactions?`)) { await api("/api/kols/" + id, { method: "DELETE" }); $("#kolDetail").innerHTML = ""; await refreshKolOptions(); loadKols(); } };
+  if ($("#editKol")) $("#editKol").onclick = () => openKolDialog(k);
+  if ($("#synthKol")) $("#synthKol").onclick = () => { show("ai"); $("#aiKol").value = k.id; runSynthesis(); };
+  if ($("#exportKol")) $("#exportKol").onclick = async () => {
+    const data = await api(`/api/kols/${id}/export`);
+    const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })), download: `kol-${id}.json` });
+    a.click(); URL.revokeObjectURL(a.href);
+  };
+  if ($("#delKol")) $("#delKol").onclick = async () => {
+    if (!confirm(`Delete ${k.name} and all their interactions?`)) return;
+    const reason = askReason("deleting this KOL"); if (!reason) return;
+    await api("/api/kols/" + id, { method: "DELETE", reason }); $("#kolDetail").innerHTML = ""; await refreshKolOptions(); loadKols();
+  };
   $("#kolDetail").scrollIntoView({ behavior: "smooth" });
 }
 function openKolDialog(k = null) {
@@ -148,8 +213,11 @@ $("#kolForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const d = formData(e.target); const id = d.id; delete d.id;
   ["tier", "publications", "trials_involved"].forEach((n) => d[n] = Number(d[n] || 0));
+  if (!d.consent_date) d.consent_date = null;
+  const reason = id ? askReason("editing this KOL") : null;
+  if (id && !reason) return;
   try {
-    await api(id ? "/api/kols/" + id : "/api/kols", { method: id ? "PUT" : "POST", body: d });
+    await api(id ? "/api/kols/" + id : "/api/kols", { method: id ? "PUT" : "POST", body: d, reason });
     $("#kolDialog").close(); await refreshKolOptions(); loadKols(); if (id) showKol(id);
   } catch (err) { alert(err.message); }
 });
@@ -172,7 +240,9 @@ $("#interactionForm").addEventListener("submit", async (e) => {
     const r = await api("/api/interactions", { method: "POST", body: d });
     const flags = r.compliance_flags.map((f) => `<div class="flag"><b>${esc(label(f.flag_type))}</b>: ${esc(f.recommended_step)}</div>`).join("");
     $("#interactionFeedback").innerHTML = `<div class="alert">Saved. Suggested insight categories:
-      ${r.suggested_categories.map((c) => `<span class="tag">${esc(label(c))}</span>`).join("") || "none detected"}</div>${flags}`;
+      ${r.suggested_categories.map((c) => `<span class="tag">${esc(label(c))}</span>`).join("") || "none detected"}</div>${flags}
+      ${r.pv_referrals.length ? `<div class="flag"><b>PV referral #${r.pv_referrals[0].id} opened</b> · due ${esc(r.pv_referrals[0].due_at)}</div>` : ""}`;
+    refreshPVBadge();
     e.target.elements.notes.value = ""; e.target.elements.topics.value = "";
     loadInteractions();
   } catch (err) { alert(err.message); }
@@ -202,12 +272,13 @@ async function runSynthesis() {
         <b>${esc(o.title)}</b></label> <span class="tag ${esc(o.priority)}">${esc(o.priority)}</span> <span class="tag">${esc(o.owner_function)}</span>
         <div>${esc(o.rationale)}</div>${ids(o.supporting_interaction_ids)}</div>`).join("") || '<p class="hint">None.</p>'}</div>
       ${s.knowledge_gaps.length ? `<h3>Knowledge gaps</h3><ul>${s.knowledge_gaps.map((g) => `<li>${esc(g)}</li>`).join("")}</ul>` : ""}
-      <button class="primary" id="btnAccept">Save themes as insights &amp; selected outcomes as actions</button></div>`;
-    $("#btnAccept").onclick = async () => {
+      ${can("ai.accept") ? '<button class="primary" id="btnAccept">Save themes as insights, selected outcomes as actions &amp; open PV referrals for AE flags</button>'
+        : '<p class="hint">A Medical Affairs lead or admin can save these results.</p>'}</div>`;
+    if ($("#btnAccept")) $("#btnAccept").onclick = async () => {
       const picked = $$(".pickOutcome").filter((c) => c.checked).map((c) => lastSynthesis.actionable_outcomes[c.dataset.i]);
-      const res = await api("/api/ai/accept", { method: "POST", body: { themes: lastSynthesis.themes, actionable_outcomes: picked } });
-      alert(`Saved ${res.insights.length} insights and ${res.actions.length} actions.`);
-      loadInsights();
+      const res = await api("/api/ai/accept", { method: "POST", body: { themes: lastSynthesis.themes, actionable_outcomes: picked, compliance_flags: lastSynthesis.compliance_flags } });
+      alert(`Saved ${res.insights.length} insights, ${res.actions.length} actions and ${res.pv_referrals.length} new PV referrals.`);
+      loadInsights(); refreshPVBadge();
     };
   } catch (err) { $("#aiResult").innerHTML = `<div class="card alert">${esc(err.message)}</div>`; }
 }
@@ -234,12 +305,16 @@ async function loadActions() {
         <div><span class="tag ${esc(a.priority)}">${esc(a.priority)}</span><span class="tag">${esc(a.owner_function)}</span>${a.source === "ai" ? '<span class="tag">AI</span>' : ""}</div>
         ${a.rationale ? `<div class="hint">${esc(a.rationale)}</div>` : ""}
         <div class="hint">Due ${esc(a.due_date ?? "–")}${overdue ? ' · <b style="color:var(--bad)">overdue</b>' : ""}</div>
-        <select data-id="${a.id}" class="small statusSel">${["open", "in_progress", "done"].map((s) => `<option value="${s}" ${s === a.status ? "selected" : ""}>${label(s)}</option>`).join("")}</select>
-        <button class="small delAct" data-id="${a.id}">Delete</button></div>`;
+        ${can("action.status") ? `<select data-id="${a.id}" class="small statusSel">${["open", "in_progress", "done"].map((s) => `<option value="${s}" ${s === a.status ? "selected" : ""}>${label(s)}</option>`).join("")}</select>` : ""}
+        ${can("action.write") ? `<button class="small delAct" data-id="${a.id}">Delete</button>` : ""}</div>`;
     }).join("");
   });
   $$(".statusSel").forEach((s) => s.onchange = async () => { await api("/api/actions/" + s.dataset.id, { method: "PATCH", body: { status: s.value } }); loadActions(); });
-  $$(".delAct").forEach((b) => b.onclick = async () => { if (confirm("Delete action?")) { await api("/api/actions/" + b.dataset.id, { method: "DELETE" }); loadActions(); } });
+  $$(".delAct").forEach((b) => b.onclick = async () => {
+    if (!confirm("Delete action?")) return;
+    const reason = askReason("deleting this action"); if (!reason) return;
+    await api("/api/actions/" + b.dataset.id, { method: "DELETE", reason }); loadActions();
+  });
 }
 $("#actionForm").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -285,5 +360,103 @@ async function loadAnalytics() {
       <td>${e.engagement}</td><td>${e.influence}</td><td>${fmt(e.avg_sentiment)}</td><td>${e.insights}</td><td><span class="tag ${esc(e.segment)}">${esc(label(e.segment))}</span></td></tr>`).join("");
   $("#notes").innerHTML = r.notes.map((n) => `• ${esc(n)}`).join("<br>");
 }
+
+// ------------------------------------------------------------------ PV referrals
+$("#pvStatus").onchange = loadPV;
+async function loadPV() {
+  const st = $("#pvStatus").value;
+  const list = await api("/api/pv" + (st ? "?status=" + st : ""));
+  const resolver = can("pv.resolve");
+  $("#pvTable").innerHTML = `<tr><th>#</th><th>Status</th><th>Due</th><th>KOL</th><th>Interaction</th><th>Excerpt</th><th>Case ref / notes</th>${resolver ? "<th></th>" : ""}</tr>` +
+    (list.map((r) => `<tr><td>${r.id}</td>
+      <td><span class="tag ${r.status === "open" ? (r.overdue ? "bad" : "warn") : "good"}">${esc(label(r.status))}${r.overdue ? " · overdue" : ""}</span></td>
+      <td>${esc(r.due_at)}</td><td>${esc(r.kol_name ?? "–")}</td><td>${r.interaction_id ?? "purged"} · ${esc(r.interaction_date ?? "")}</td>
+      <td class="wrap"><i>${esc(r.excerpt)}</i></td><td>${esc(r.pv_case_ref ?? "")} ${esc(r.notes ?? "")}</td>
+      ${resolver ? `<td>${r.status === "open" ? `<button class="small pvReport" data-id="${r.id}">Mark reported</button>
+        <button class="small pvNotAE" data-id="${r.id}">Not an AE</button>` : `<button class="small pvReopen" data-id="${r.id}">Reopen</button>`}</td>` : ""}</tr>`).join("")
+      || `<tr><td colspan="8" class="hint">No referrals.</td></tr>`);
+  const patch = async (id, body) => { try { await api("/api/pv/" + id, { method: "PATCH", body }); loadPV(); refreshPVBadge(); } catch (e) { alert(e.message); } };
+  $$(".pvReport").forEach((b) => b.onclick = () => { const ref = prompt("PV safety database case reference:"); if (ref) patch(b.dataset.id, { status: "reported", pv_case_ref: ref }); });
+  $$(".pvNotAE").forEach((b) => b.onclick = () => { const n = prompt("Justification (why this is not an adverse event):"); if (n) patch(b.dataset.id, { status: "not_an_ae", notes: n }); });
+  $$(".pvReopen").forEach((b) => b.onclick = () => { const n = prompt("Reason for reopening:"); if (n) patch(b.dataset.id, { status: "open", notes: n }); });
+}
+
+// ------------------------------------------------------------------ admin
+async function loadAdmin() {
+  loadAudit();
+  if (!can("admin")) return;
+  const users = await api("/api/users");
+  $("#userTable").innerHTML = `<tr><th>User</th><th>Name</th><th>Role</th><th>Active</th><th></th></tr>` + users.map((u) => `<tr>
+    <td>${esc(u.username)}</td><td>${esc(u.full_name ?? "")}</td>
+    <td><select class="small uRole" data-id="${u.id}">${META.roles.map((r) => `<option ${r === u.role ? "selected" : ""}>${r}</option>`).join("")}</select></td>
+    <td>${u.active ? "yes" : "no"}</td>
+    <td><button class="small uToggle" data-id="${u.id}" data-active="${u.active}">${u.active ? "Deactivate" : "Activate"}</button>
+      <button class="small uPw" data-id="${u.id}">Reset password</button></td></tr>`).join("");
+  const patchUser = async (id, body) => { try { await api("/api/users/" + id, { method: "PATCH", body }); } catch (e) { alert(e.message); } loadAdmin(); };
+  $$(".uRole").forEach((s) => s.onchange = () => patchUser(s.dataset.id, { role: s.value }));
+  $$(".uToggle").forEach((b) => b.onclick = () => patchUser(b.dataset.id, { active: b.dataset.active !== "1" }));
+  $$(".uPw").forEach((b) => b.onclick = () => { const p = prompt("New password (≥10 characters):"); if (p) patchUser(b.dataset.id, { password: p }); });
+
+  const st = await api("/api/settings");
+  const num = (name, v, step = "any") => `<label>${esc(label(name.split(".").pop()))}<input type="number" step="${step}" min="0" name="${name}" value="${v}"></label>`;
+  $("#settingsForm").innerHTML = `
+    <h4>Engagement: interaction type weights</h4><div class="row">${Object.entries(st.type_weights).map(([k, v]) => num("tw." + k, v)).join("")}</div>
+    <div class="row">${num("recency_half_life_days", st.recency_half_life_days, 1)}${num("pv_sla_hours", st.pv_sla_hours, 1)}${num("retention_days", st.retention_days, 1)}</div>
+    <h4>Influence weights (must sum to 1)</h4><div class="row">${Object.entries(st.influence_weights).map(([k, v]) => num("iw." + k, v)).join("")}</div>
+    <label class="check"><input type="checkbox" name="require_change_reason" ${st.require_change_reason ? "checked" : ""}> Require a reason for edits and deletions</label>
+    <label class="check"><input type="checkbox" name="ai_enabled" ${st.ai_enabled ? "checked" : ""}> Allow sending pseudonymised notes to Claude</label>
+    <button class="primary">Save settings</button> <span id="settingsMsg" class="hint"></span>`;
+  $("#retDays").value = st.retention_days;
+}
+$("#settingsForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target, body = { type_weights: {}, influence_weights: {} };
+  $$("input[type=number]", f).forEach((i) => {
+    const [grp, key] = i.name.split(".");
+    if (grp === "tw") body.type_weights[key] = Number(i.value);
+    else if (grp === "iw") body.influence_weights[key] = Number(i.value);
+    else body[i.name] = Number(i.value);
+  });
+  body.require_change_reason = f.elements.require_change_reason.checked;
+  body.ai_enabled = f.elements.ai_enabled.checked;
+  try { await api("/api/settings", { method: "PUT", body }); META = await api("/api/meta"); $("#settingsMsg").textContent = "Saved."; }
+  catch (err) { $("#settingsMsg").textContent = err.message; }
+});
+$("#userForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try { await api("/api/users", { method: "POST", body: formData(e.target) }); e.target.reset(); loadAdmin(); }
+  catch (err) { alert(err.message); }
+});
+async function retention(dry) {
+  const days = Number($("#retDays").value);
+  if (!dry && !confirm(`Permanently delete interactions older than ${days} days?`)) return;
+  try {
+    const r = await api("/api/admin/retention", { method: "POST", body: { older_than_days: days, dry_run: dry } });
+    $("#retResult").textContent = `${dry ? "Would delete" : "Deleted"} ${r.interactions} interactions and ${r.linked_insights} linked insights dated before ${r.cutoff}.`;
+  } catch (err) { $("#retResult").textContent = err.message; }
+}
+$("#btnRetDry").onclick = () => retention(true);
+$("#btnRetRun").onclick = () => retention(false);
+async function loadAudit() {
+  const q = new URLSearchParams({ limit: 200 });
+  if ($("#auditUser").value) q.set("username", $("#auditUser").value);
+  if ($("#auditEntity").value) q.set("entity", $("#auditEntity").value);
+  const log = await api("/api/audit?" + q);
+  const pretty = (j) => j ? `<pre class="json">${esc(JSON.stringify(JSON.parse(j), null, 1))}</pre>` : "";
+  $("#auditTable").innerHTML = `<tr><th>#</th><th>Time (UTC)</th><th>User</th><th>Action</th><th>Entity</th><th>Reason</th><th>Before</th><th>After</th></tr>` +
+    log.map((a) => `<tr><td>${a.id}</td><td>${esc(a.ts)}</td><td>${esc(a.username)}</td><td>${esc(a.action)}</td>
+      <td>${esc(a.entity)} ${a.entity_id ?? ""}</td><td>${esc(a.reason ?? "")}</td><td class="wrap">${pretty(a.before_json)}</td><td class="wrap">${pretty(a.after_json)}</td></tr>`).join("");
+}
+$("#btnAuditLoad").onclick = loadAudit;
+$("#btnAuditVerify").onclick = async () => {
+  const v = await api("/api/audit/verify");
+  $("#auditVerify").innerHTML = v.valid ? `<span class="tag good">Chain intact · ${v.records} records</span>`
+    : `<span class="tag bad">Tampering detected at record #${v.first_invalid_id}</span>`;
+};
+$("#pwForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try { await api("/api/auth/password", { method: "POST", body: formData(e.target) }); e.target.reset(); alert("Password changed."); }
+  catch (err) { alert(err.message); }
+});
 
 init().catch((e) => { document.body.insertAdjacentHTML("afterbegin", `<div class="alert">Failed to load: ${esc(e.message)}</div>`); });

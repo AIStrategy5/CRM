@@ -5,10 +5,18 @@ Usage:  python -m app.seed            (writes to CRM_DB_PATH or data/crm.db, rep
 from __future__ import annotations
 
 import json
+import os
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from .db import connect, db_path, init_db
+from .security import create_user
+
+# Demo-only accounts. Never use these credentials outside a local demo.
+DEMO_PASSWORD = "demo-password-123"
+DEMO_USERS = [("admin", "admin", "Demo Admin"), ("lead", "lead", "Demo Medical Lead"),
+              ("msl", "msl", "Demo MSL"), ("viewer", "viewer", "Demo Viewer")]
 
 FIRST = ["Amara", "Bruno", "Chen", "Dana", "Elif", "Farid", "Grace", "Hiro", "Ines", "Jonas",
          "Kavya", "Lena", "Mateo", "Nadia", "Omar", "Priya", "Quinn", "Rosa", "Sami", "Tara",
@@ -54,7 +62,7 @@ MSLS = ["MSL North", "MSL South", "MSL East", "MSL West"]
 def seed(conn, today: date | None = None, n_kols: int = 36, months: int = 15, rng_seed: int = 7) -> dict:
     rnd = random.Random(rng_seed)
     today = today or date.today()
-    for t in ("actions", "insights", "interactions", "kols"):
+    for t in ("pv_referrals", "actions", "insights", "interactions", "kols"):
         conn.execute(f"DELETE FROM {t}")
     conn.execute("DELETE FROM sqlite_sequence")
 
@@ -72,9 +80,10 @@ def seed(conn, today: date | None = None, n_kols: int = 36, months: int = 15, rn
         trials = int(rnd.lognormvariate({1: 2.4, 2: 1.5, 3: 0.6}[tier], 0.6))
         cur = conn.execute(
             "INSERT INTO kols (name, specialty, institution, region, therapeutic_area, tier, publications,"
-            " trials_involved, email) VALUES (?,?,?,?,?,?,?,?,?)",
+            " trials_involved, email, consent_status, consent_date) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (name, rnd.choice(TA_SPECIALTY[ta]), rnd.choice(INSTITUTIONS), rnd.choice(REGIONS), ta, tier,
-             pubs, trials, name.lower().replace("dr. ", "").replace(" ", ".") + "@example.org"))
+             pubs, trials, name.lower().replace("dr. ", "").replace(" ", ".") + "@example.org",
+             "withdrawn" if i == n_kols - 1 else "granted", (today - timedelta(days=400)).isoformat()))
         kol_ids.append((cur.lastrowid, ta, tier))
 
     cats = list(NOTE_TEMPLATES)
@@ -90,7 +99,8 @@ def seed(conn, today: date | None = None, n_kols: int = 36, months: int = 15, rn
             d = start + timedelta(days=int((30 * months) * (rnd.random() ** 0.7)))
             cat = rnd.choice(ta_bias) if rnd.random() < 0.55 else rnd.choice(cats)
             notes = rnd.choice(NOTE_TEMPLATES[cat])
-            if rnd.random() < 0.03:
+            ae_note = rnd.random() < 0.03
+            if ae_note:
                 notes += " " + rnd.choice(COMPLIANCE_NOTES)
             base = {1: 0.35, 2: 0.2, 3: 0.05}[tier] + (-0.25 if cat == "safety_perception" else 0)
             sentiment = max(-1.0, min(1.0, round(rnd.gauss(base, 0.3), 2)))
@@ -100,6 +110,14 @@ def seed(conn, today: date | None = None, n_kols: int = 36, months: int = 15, rn
                 (kid, d.isoformat(), rnd.choice(TYPES), rnd.choice(["in_person", "in_person", "virtual", "phone"]),
                  rnd.choice(MSLS), cat.replace("_", " "), notes, sentiment, rnd.choice([20, 30, 45, 60, 90])))
             n_inter += 1
+            if ae_note and "adverse event" in notes:
+                created = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
+                conn.execute(
+                    "INSERT INTO pv_referrals (interaction_id, kol_id, excerpt, status, due_at, created_at)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (cur.lastrowid, kid, notes[-110:], "reported" if (today - d).days > 30 else "open",
+                     (created + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     created.strftime("%Y-%m-%d %H:%M:%S")))
             if rnd.random() < 0.35:
                 conn.execute(
                     "INSERT INTO insights (kol_id, interaction_id, category, therapeutic_area, text, created_at)"
@@ -119,6 +137,12 @@ def seed(conn, today: date | None = None, n_kols: int = 36, months: int = 15, rn
 
 
 if __name__ == "__main__":
-    c = connect()
+    path = db_path()
+    if path != ":memory:" and Path(path).exists():
+        os.remove(path)  # start fresh: the audit log is append-only by design
+    c = connect(path)
     init_db(c)
-    print(f"Seeded {db_path()}:", seed(c))
+    for username, role, full_name in DEMO_USERS:
+        create_user(c, username, DEMO_PASSWORD, role, full_name)
+    print(f"Seeded {path}:", seed(c))
+    print(f"Demo logins (password '{DEMO_PASSWORD}'): " + ", ".join(u for u, _, _ in DEMO_USERS))
