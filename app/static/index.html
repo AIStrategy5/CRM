@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Medical Affairs CRM</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%232f6fdb%22/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/vendor/chart.umd.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">MA·CRM <span class="muted">KOL insights &amp; engagement</span></div>
+  <nav id="nav">
+    <button data-view="dashboard" class="active">Dashboard</button>
+    <button data-view="kols">KOLs</button>
+    <button data-view="interactions">Interactions</button>
+    <button data-view="ai">AI Insights</button>
+    <button data-view="actions">Actions</button>
+    <button data-view="analytics">Analytics</button>
+  </nav>
+  <span id="engine" class="pill"></span>
+</header>
+
+<main>
+  <!-- Dashboard -->
+  <section id="view-dashboard" class="view active">
+    <div id="kpis" class="kpis"></div>
+    <div class="grid2">
+      <div class="card"><h3>Monthly engagement</h3><canvas id="chMonthly"></canvas></div>
+      <div class="card"><h3>Influence vs engagement</h3><canvas id="chScatter"></canvas>
+        <p class="hint">Bottom-right quadrant = influential KOLs with low engagement (“priority gap”).</p></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><h3>Priority gaps – plan outreach</h3><div id="gapList"></div></div>
+      <div class="card"><h3>Insight categories</h3><canvas id="chCats"></canvas></div>
+    </div>
+  </section>
+
+  <!-- KOLs -->
+  <section id="view-kols" class="view">
+    <div class="toolbar">
+      <input id="kolSearch" placeholder="Search name, institution, specialty…">
+      <select id="kolTA"><option value="">All therapeutic areas</option></select>
+      <select id="kolTier"><option value="">All tiers</option><option>1</option><option>2</option><option>3</option></select>
+      <button class="primary" id="btnNewKol">+ New KOL</button>
+      <a class="btn" href="/api/export/kols.csv">Export CSV</a>
+    </div>
+    <div class="card"><table id="kolTable"></table></div>
+    <div id="kolDetail"></div>
+  </section>
+
+  <!-- Interactions -->
+  <section id="view-interactions" class="view">
+    <div class="grid2">
+      <form id="interactionForm" class="card form">
+        <h3>Log interaction</h3>
+        <label>KOL<select name="kol_id" required></select></label>
+        <div class="row">
+          <label>Date<input type="date" name="date" required></label>
+          <label>Type<select name="type"></select></label>
+          <label>Channel<select name="channel"></select></label>
+        </div>
+        <div class="row">
+          <label>MSL owner<input name="msl_owner"></label>
+          <label>Duration (min)<input type="number" name="duration_min" min="0"></label>
+          <label>Sentiment <output id="sentOut">0</output><input type="range" name="sentiment" min="-1" max="1" step="0.1" value="0"></label>
+        </div>
+        <label>Topics<input name="topics" placeholder="e.g. data gap, sequencing"></label>
+        <label>Notes (non-promotional scientific exchange)<textarea name="notes" rows="5"></textarea></label>
+        <button class="primary">Save interaction</button>
+        <div id="interactionFeedback"></div>
+      </form>
+      <div class="card"><h3>Recent interactions</h3>
+        <a class="btn small" href="/api/export/interactions.csv">Export CSV</a>
+        <div id="interactionList" class="list"></div></div>
+    </div>
+  </section>
+
+  <!-- AI -->
+  <section id="view-ai" class="view">
+    <div class="card form">
+      <h3>Synthesize KOL insights into actionable outcomes</h3>
+      <div class="row">
+        <label>Therapeutic area<select id="aiTA"><option value="">All</option></select></label>
+        <label>KOL<select id="aiKol"><option value="">All</option></select></label>
+        <label>Since<input type="date" id="aiSince"></label>
+        <label>Max interactions<input type="number" id="aiMax" value="60" min="1" max="300"></label>
+        <label class="check"><input type="checkbox" id="aiUse" checked> Use Claude (if configured)</label>
+      </div>
+      <button class="primary" id="btnSynth">Run synthesis</button>
+      <p class="hint">KOL names, emails and institutions are pseudonymised (KOL-&lt;id&gt;) before being sent to the model.
+        Compliance flags always include a deterministic keyword scan. Treat all output as a draft for human review.</p>
+    </div>
+    <div id="aiResult"></div>
+    <div class="card"><h3>Insight library</h3>
+      <form id="insightForm" class="row">
+        <select name="kol_id"></select><select name="category"></select>
+        <input name="text" placeholder="Insight statement" required style="flex:3">
+        <button class="primary">Add</button>
+      </form>
+      <div id="insightList" class="list"></div></div>
+  </section>
+
+  <!-- Actions -->
+  <section id="view-actions" class="view">
+    <form id="actionForm" class="card form row">
+      <input name="title" placeholder="Action title" required style="flex:3">
+      <select name="owner_function"></select>
+      <select name="priority"><option>high</option><option selected>medium</option><option>low</option></select>
+      <input type="date" name="due_date">
+      <button class="primary">Add action</button>
+    </form>
+    <div class="kanban">
+      <div class="col"><h3>Open</h3><div id="col-open"></div></div>
+      <div class="col"><h3>In progress</h3><div id="col-in_progress"></div></div>
+      <div class="col"><h3>Done</h3><div id="col-done"></div></div>
+    </div>
+  </section>
+
+  <!-- Analytics -->
+  <section id="view-analytics" class="view">
+    <div class="grid2">
+      <div class="card"><h3>Sentiment by KOL tier (mean ± 95% CI)</h3><canvas id="chTier"></canvas><div id="tierTest"></div></div>
+      <div class="card"><h3>Sentiment by interaction type</h3><canvas id="chType"></canvas><div id="typeTest"></div></div>
+    </div>
+    <div class="card"><h3>Statistical tests</h3><div id="tests"></div></div>
+    <div class="card"><h3>Insight category × therapeutic area</h3><div id="xtab"></div></div>
+    <div class="card"><h3>KOL engagement scores</h3>
+      <a class="btn small" href="/api/export/engagement.csv">Export CSV</a>
+      <table id="engTable"></table>
+      <p class="hint">Engagement = Σ(type weight × 0.5^(days ago / 90)), scaled 0–100 to the most engaged KOL.
+        Influence = log-scaled publications (45%) + trials (30%) + tier (25%). Both are configurable heuristics.</p></div>
+    <div id="notes" class="hint"></div>
+  </section>
+</main>
+
+<dialog id="kolDialog">
+  <form id="kolForm" method="dialog" class="form">
+    <h3 id="kolDialogTitle">New KOL</h3>
+    <input type="hidden" name="id">
+    <label>Name<input name="name" required></label>
+    <div class="row"><label>Specialty<input name="specialty" required></label>
+      <label>Therapeutic area<input name="therapeutic_area" required list="taList"></label></div>
+    <div class="row"><label>Institution<input name="institution"></label><label>Region<input name="region"></label></div>
+    <div class="row"><label>Tier<select name="tier"><option>1</option><option selected>2</option><option>3</option></select></label>
+      <label>Publications<input type="number" name="publications" value="0" min="0"></label>
+      <label>Trials<input type="number" name="trials_involved" value="0" min="0"></label></div>
+    <label>Email<input name="email" type="email"></label>
+    <label>Notes<textarea name="notes" rows="2"></textarea></label>
+    <div class="row"><button value="cancel" formnovalidate>Cancel</button><button class="primary" value="save">Save</button></div>
+  </form>
+</dialog>
+<datalist id="taList"></datalist>
+<script src="/static/app.js"></script>
+</body>
+</html>
